@@ -1167,7 +1167,7 @@ public class ESApplicationoTest {
 
 # 实战测试
 
-## **爬取数据**
+## 爬取数据
 
 jsoup是一个java爬虫库，mavne引入
 
@@ -1181,7 +1181,7 @@ jsoup是一个java爬虫库，mavne引入
 
 爬取数据
 
-```json
+```java
 @Service
 public class CrawlerDao {
     public List<Content> parseJD(String keywords) throws Exception {
@@ -1220,7 +1220,7 @@ public class CrawlerDao {
 
 ### controller
 
-```json
+```java
 @RestController
 public class ContentController {
     @Autowired
