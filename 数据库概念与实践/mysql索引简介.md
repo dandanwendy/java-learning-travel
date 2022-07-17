@@ -1,3 +1,5 @@
+[toc]
+
 #  MySQL索引介绍
 
 ## 概念
@@ -133,7 +135,16 @@ CREATE TABLE tab3(
 
 ##  全文索引
 
-主要用来查找文本中的关键字，而不是直接与索引中的值相比较。fulltext索引跟其它索引大不相同，它更像是一个搜索引擎，而不是简单的where语句的参数匹配。fulltext索引配合match against操作使用，而不是一般的where语句加like。它可以在create table，alter table ，create index使用，不过目前只有char、varchar，text 列上可以创建全文索引。值得一提的是，在数据量较大时候，现将数据放入一个没有全局索引的表中，然后再用CREATE index创建fulltext索引，要比先为一张表建立fulltext然后再将数据写入的速度快很多。
+主要用来查找文本中的关键字，而不是直接与索引中的值相比较。fulltext索引跟其它索引大不相同，它更像是一个搜索引擎，而不是简单的where语句的参数匹配。fulltext索引配合match against操作使用，而不是一般的where语句加like。
+
+值得一提的是，在数据量较大时候，先将数据放入一个没有全局索引的表中，然后再用CREATE index创建fulltext索引，要比先为一张表建立fulltext然后再将数据写入的速度快很多。这意味着全文索引很影响数据的写入。
+
+注意：innodb存储引擎在mysql 5.6以后才支持全文索引。
+
+### 创建全文索引
+
+全文索引可以在create table，alter table ，create index时建立，不过目前只有char、varchar，text 列上可以创建全文索引。
+
 ```mysql
 # 1.创建表的适合添加全文索引
 CREATE TABLE `table` (
@@ -152,7 +163,267 @@ ALTER TABLE article ADD FULLTEXT index_content(content)
 CREATE FULLTEXT INDEX index_content ON article(content)
 ```
 
+### 全文检索模式
+
+常用的全文检索模式有两种：
+
+1、自然语言模式(NATURAL LANGUAGE MODE) ， 自然语言模式是MySQL 默认的全文检索模式。自然语言模式不能使用操作符，不能指定关键词必须出现或者必须不能出现等复杂查询。
+
+2、BOOLEAN模式(BOOLEAN MODE) BOOLEAN模式可以使用操作符，可以支持指定关键词必须出现或者必须不能出现或者关键词的权重高还是低等复杂查询。
+
+### 使用例子
+
+在假设我们现在有一章文章表，可以在文章的标题和内容上建立全文索引
+
+```mysql
+CREATE TABLE articles (
+    id INT UNSIGNED AUTO_INCREMENT NOT NULL PRIMARY KEY,
+    title VARCHAR (200),
+    body TEXT,
+    FULLTEXT (title, body) WITH PARSER ngram
+) ENGINE = INNODB;
+```
+
+假设我们要从文章标题或内容汇总查找特定关键词，可以使用 match against命令，如下
+
+```mysql
+SELECT * FROM articles
+WHERE MATCH (title,body)
+AGAINST ('一路 一带' IN NATURAL LANGUAGE MODE);
+
+// 不指定模式，默认使用自然语言模式
+SELECT * FROM articles
+WHERE MATCH (title,body)
+AGAINST ('一路 一带');
+```
+
+# 单表索引优化案例分析
+
+```mysql
+#创建表的SQL语句
+CREATE TABLE article(
+	id INT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
+	author_id INT(10) UNSIGNED NOT NULL,
+	category_id INT(10) UNSIGNED NOT NULL,
+	views INT(10) UNSIGNED NOT NULL,
+	comments INT(10) UNSIGNED NOT NULL,
+	title VARBINARY(255) NOT NULL,
+	content TEXT NOT NULL
+);
+ 
+INSERT INTO article(author_id,category_id,views,comments,title,content) 
+VALUES(1,1,1,1,'1','1'),(2,2,2,2,'2','2'),(3,3,3,3,'3','3');
+```
+
+在没有创建索引的时候，使用explain查看执行计划
+
+```mysql
+# 查询category_id=1 且comments>1的情况下，views最多的article_id
+EXPLAIN 
+SELECT id,author_id 
+FROM article 
+WHERE category_id=1 
+AND comments>1 
+ORDER BY views DESC 
+LIMIT 1;
+```
+
+结论：type是ALL，最坏的情况，extra中出现了using filesort，也是最坏的情况，必须进行优化
+
+![img](./mysql_index_photo/案例分析1.png)
+
+```mysql
+#开始优化
+#创建索引
+#alter table article add index idx_article_ccv(category_id,comments,views);
+CREATE INDEX idx_article_ccv ON article(category_id,comments,views);
+ 
+#第二次explain
+EXPLAIN 
+SELECT id,author_id 
+FROM article 
+WHERE category_id=1 
+AND comments>1 
+ORDER BY views DESC 
+LIMIT 1;
+```
+
+![img](./mysql_index_photo/案例分析2.png)
+
+type变成了range，这是可以忍受的，但是extra里using filesort是无法接受的。但是已经创建了索引，为什么没有用？因为按照Btree索引的工作原理，先降序category_id，如果遇到相同的category_id，再排序comments，如果遇到相同的comments，再排序views。当comments字段在联合索引中处于中间位置时，因comments>1条件是一个范围值，故MySQL无法利用索引再对后面的views部分进行检索，即range类型查询字段后面的索引无效。
+```mysql
+#删除第一次创建的索引
+DROP INDEX idx_article_ccv ON article;
+ 
+#第2次新建索引
+CREATE INDEX idx_article_cv ON article(category_id,views);
+ 
+#第3次explain
+EXPLAIN 
+SELECT id,author_id 
+FROM article 
+WHERE category_id=1 
+AND comments>1 
+ORDER BY views DESC 
+LIMIT 1;
+```
+
+![img](./mysql_index_photo/案例分析3.png)
+
+ 结论：type变成ref，extra中的using filesort也消失了，结果非常理想。
+
+# Expalin分析sql查询
+
+```mysql
+EXPLAIN SELECT * FROM (SELECT * FROM uchome_space LIMIT 10) AS s
+```
+
+它的执行结果
+
+![img](.\mysql_index_photo\explain结果.png)
+
+**1-id**
+
+select查询的序列号，包含一组数字，表示查询中执行select子句或操作表的顺序
+
+- id相同，执行顺序由上至下
+- id不同，如果是子查询，id的序号会递增，id值越大优先级越高，越先被执行
+- id相同不同，同时存在
+
+**2-select_type**
+
+查询的类型，主要是用于区别普通查询、联合查询、子查询等
+
+- SIMPLE：简单的select查询，查询中不包含子查询或者UNION。
+- PRIMARY：查询中包含任何复杂的子部分，最外层查询则被标记为PRIMARY。
+- SUBQUERY：包含在select中的子查询，但又不在from的子句中，会被标记为SUBQUERY。
+- DERIVED：在FROM列表中包含的子查询被标记为DERIVED（衍生），如上图结果。。MySQL会递归执行这些子查询，把结果放在临时表里。
+- UNION：若第二个SELECT出现在UNION之后，则被标记为UNION；若UNION包含在FROM子句的子查询中，外层SELECT将被标记为：DERIVED。
+- UNION RESULT：从UNION表中获取结果的SELECT。
+
+**3-table**
+
+输出的行所用的表，这个参数显而易见，容易理解
+
+**4-partitions**
+
+查询将匹配记录的分区。 对于非分区表，该值为 NULL。
+
+**5-type**
+
+显示的是访问类型，是衡量查询效率较为重要的一个指标。
+
+结果值从最好到最坏依次是：system>const>eq_ref>ref>range>index>All
+
+- system：表只有一行记录（等于系统表），这是const类型的特例，平时不会出现，这个也可以忽略不计。
+- const：表示通过索引一次就找到了，const用于比较primary key或则unique索引。因为只匹配一行数据，所以很快。如将主键置于where列表中，MySQL就能将该查询转换为一个常量。
+- eq_ref：唯一性索引扫描，对于每个索引键，表中只有一条记录与之匹配。常见于主键或唯一索引扫描。
+- ref：非唯一性索引扫描，返回匹配某个单独值的所有行。本质上也是一种索引访问，它返回所有匹配某个单独值的行，然而，它可能会找到多个符合条件的行，所以它应该属于查找和扫描的混合体。
+- range：只检索给定范围的行，使用一个索引来选择行。key列显示使用了哪个索引。一般就是在你的where语句中出现了between、<、>、in等的查询。这种范围扫描索引扫描比全表扫描要好，因为它只需要开始于索引的某一点，而结束于另一点，不会扫描全部索引。
+- index：Full Index Scan，index与All区别为index类型只遍历索引树。这通常比All快，因为索引文件通常比数据文件小。（也就是说虽然all和index都是读全表，但index是从索引中读取的，而all是从硬盘中读的）
+- all：Full Table Scan，将遍历全表以找到匹配的行。
+
+一般来说，得保证查询至少达到range级别，最好能达到ref。
+
+**6-possible_keys**
+
+此列显示在查询中可能用到的索引。
+
+如果该列为NULL，则表示没有相关索引，可以通过检查where子句看是否可以添加一个适当的索引来提高性能。
+
+**7-key**
+
+此列显示MySQL在查询时实际用到的索引。
+
+在执行计划中可能出现possible_keys列有值，而key列为null，这种情况可能是表中数据不多，MySQL认为索引对当前查询帮助不大而选择了全表查询。如果想强制MySQL使用或忽视possible_keys列中的索引，在查询时可使用force index、ignore index。
+
+查询中若使用了覆盖索引，则该索引仅出现在key列表中，不会出现在possible_keys列表中。（覆盖索引：查询的字段与建立的复合索引的个数一一吻合）
+
+**8-key_len**
+
+key_len显示的值为索引字段的最大可能长度，并非实际使用长度，即key_len是根据表定义计算而得，不是通过表内检索出的。在不损失精确性的情况下，长度越短越好。
+
+根据表定义时的数据类型，基本可以按下表计算key_len。
+
+| 列类型                         | KEY_LEN          | 备注                                                         |
+| :----------------------------- | :--------------- | :----------------------------------------------------------- |
+| id int                         | key_len = 4+1    | int为4bytes,允许为NULL,加1byte                               |
+| id bigint not null             | key_len=8        | bigint为8bytes                                               |
+| user char(30) utf8             | key_len=30*3+1   | utf8每个字符为3bytes,允许为NULL,加1byte                      |
+| user varchar(30) not null utf8 | key_len=30*3+2   | utf8每个字符为3bytes,变长数据类型,加2bytes                   |
+| user varchar(30) utf8          | key_len=30*3+2+1 | utf8每个字符为3bytes,允许为NULL,加1byte,变长数据类型,加2bytes |
+| detail text(10) utf8           | key_len=30*3+2+1 | TEXT截取部分,被视为动态列类型。                              |
+
+**9-ref**  
+
+使用key列的索引查找数据时，使用到的列或常量，常见的有const、字段名。比如查找时用了id='uuid'，一般结果就是const，因为这时用到的索引值就是常量。如果是利用索引查多条数据，结果就是字段名。
+
+**10-rows**
+
+此列显示key列记录的索引中，表查找值时使用到的列或常量。常见的有const、字段名。
+
+从上表分析结果可以看出，子查询仅查询10行数据，竟然要读取17000行。这是因为子查询使用了select *, 这个分析结果表明最好不要在查询中使用  select *，它确实很影响效率。
+
+**11-extra**
+
+此列是一些额外信息。常见的重要值如下：
+
+- Using filesort：说明mysql会对数据使用一个外部的索引排序，而不是按照表内的索引顺序进行读取。MySQL中无法利用索引完成的排序操作成为“文件排序”。
+- Using temporary：使用了临时表保存中间结果，MySQL在对查询结果排序时使用临时表。常见于排序order by和分组查询group by。
+- Using index：表示相应的select操作中使用了覆盖索引（Covering Index），避免访问了表的数据行，效率不错！如果同时出现using where，表明索引被用来执行索引键值的查找；如果没有同时出现using where，表明索引用来读取数据而非执行查找动作。
+- Using where：表明使用了where过滤。
+- Using join buffer：使用了连接缓存。
+- impossible where：where子句的值总是false，不能用来获取任何元组。（查询语句中where的条件不可能被满足，恒为False）
+- select tables optimized away：在没有GROUPBY子句的情况下，基于索引优化MIN/MAX操作或者对于MyISAM存储引擎优化COUNT(*)操作，不必等到执行阶段再进行计算，查询执行计划生成的阶段即完成优化。
+- distinct：优化distinct操作，在找到第一匹配的元组后即停止找相同值的动作。
+  
+
+# 索引失效
+
+可以使用Explain工具分析索引是否生效，如果结果中 key 列为 NULL，表明索引失效。
+
+1. 联合索引（符合索引）不使用第一部分
+
+创建联合索引，但是没有遵循最左前缀法则，则会出现索引失效的情况。如果索引了多列，要遵守最左前缀法则。指的是查询从索引的最左前列开始并且不跳过索引中的列。（带头大哥不能死，中间兄弟不能断哈哈哈）
+
+2. where条件有数学运算或函数
+
+3. mysql在使用不等于（！=或者<>）的时候无法使用索引会导致全表扫描
+
+4. mysql在使用 is null，is not null也无法使用索引
+
+5. like以通配符开头(‘%abc…’)mysql索引失效会变成全表扫描的操作，当%加在右边时可以使用
+
+6. 字符串不加单引号索引失效
+
+7. where条件使用or
+
+注意：要想使用or，又想让索引生效，只能将or条件中的每个列都加上索引。
+
+可以使用下面的表格与数据，执行查询语句验证上面几种索引失效的情况。
+
+```sql
+#创建员工表
+CREATE TABLE staffs(
+	id INT PRIMARY KEY AUTO_INCREMENT,
+	NAME VARCHAR(24) NOT NULL DEFAULT "" COMMENT '姓名',
+	age INT NOT NULL DEFAULT 0 COMMENT '年龄',
+	pos VARCHAR(20) NOT NULL DEFAULT "" COMMENT '职位',
+	add_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT'入职时间'
+) CHARSET utf8 COMMENT '员工记录表';
+ 
+INSERT INTO staffs(NAME,age,pos,add_time) VALUES('z3',22,'manager',NOW()),('july',23,'dev',NOW()),('2000',23,'dev',NOW());
+ 
+ 
+#创建索引
+ALTER TABLE staffs ADD INDEX idx_staffs_nameAgePos(NAME,age,pos);
+```
+
 
 
 # 索引底层原理——B+树
+
+# 参考文档
+
+[MySQL索引介绍及使用](https://blog.csdn.net/sarracode/article/details/119929131)
 
